@@ -118,6 +118,53 @@ def load_data():
             
             # 关键修复：过滤掉“广告账号”为空的行 (例如 Google Sheet 的空行)
             raw_df = raw_df[raw_df['广告账号'] != '']
+
+            # ---------------------------------------------------------------------
+            # 自动去重 (Deduplication)
+            # ---------------------------------------------------------------------
+            # 用户需求：相同维度的数据应“覆盖”而非累加。
+            # 策略：识别所有维度列（排除已知数值列），对完全相同的维度组合保留最后一行 (keep='last')。
+            
+            exclude_metrics = [
+                '费用', '转化价值', '转化数', 'ROAS', 
+                'Cost', 'Conversions', 'Conversion value', 
+                'Clicks', 'Impressions', 'CTR', 'CPC', 'Views',
+                'Interactions', 'Interaction rate', 'Avg. cost', 'Avg. CPM',
+                'Search Impr. share', 'Display Impr. share', 'IIV', 'Invalid clicks'
+            ]
+            # 策略升级：不仅仅排除完全匹配的列，还要排除包含特定关键词的列 (Metric-like columns)
+            # 以防止 "Avg. CPC" 或 "Ctr" 大小写/空格 差异导致去重失败
+            metric_keywords = ['cost', 'value', 'cpc', 'cpm', 'ctr', 'rate', 'clicks', 'impressions', 'conversions', 'roas', 'view']
+            
+            def is_metric_col(col_name):
+                if col_name in exclude_metrics: return True
+                c_lower = col_name.lower()
+                for kw in metric_keywords:
+                    if kw in c_lower:
+                        return True
+                return False
+
+            dedup_subset = [c for c in raw_df.columns if not is_metric_col(c)]
+            
+            if dedup_subset:
+                # 记录去重前行数，用于 debug 或提示
+                # before_count = len(raw_df)
+                # 转换所有维度列为字符串并 strip，消除隐形差异
+                # 注意：这只用于判断去重，不改变原始数据类型，或者我们直接改变也没关系，因为通常维度就是字符串
+                # 为了安全，我们只在临时 copy 上做标准化 key
+                
+                # 也可以直接 inplace 清洗维度列
+                for col in dedup_subset:
+                     raw_df[col] = raw_df[col].astype(str).str.strip()
+
+                raw_df = raw_df.drop_duplicates(subset=dedup_subset, keep='last')
+                # after_count = len(raw_df)
+
+            # 关键修复：去重时将“天”转为了字符串，这里必须转回 datetime，否则后续筛选会报错
+            if '天' in raw_df.columns:
+                raw_df['天'] = pd.to_datetime(raw_df['天'], errors='coerce')
+
+
         
         if '广告账号' in manager_map.columns:
             manager_map['广告账号'] = manager_map['广告账号'].astype(str).str.strip() # 去除 ID 空格
@@ -162,17 +209,25 @@ def load_data():
              category_map['clean_url'] = "" # Should define clean_url column anyway
         
         if '类目' in category_map.columns:
+            # 关键修复：如果你之前已经把 '类目' 写进 Raw_Data 了，这里 merge 会导致 duplicate columns (类目_x, 类目_y)
+            # 所以 merge 前先 drop 掉 merged_df 里的旧类目，以 Category Map 的最新映射为准
+            if '类目' in merged_df.columns:
+                merged_df = merged_df.drop(columns=['类目'])
+                
             category_map_dedup = category_map[['clean_url', '类目']].drop_duplicates()
             merged_df = pd.merge(merged_df, category_map_dedup, on='clean_url', how='left')
             merged_df['类目'] = merged_df['类目'].fillna("Unknown")
         else:
-            merged_df['类目'] = "Unknown"
+            # 如果 Map 里没类目，但 Raw Data 里可能有??
+            if '类目' not in merged_df.columns:
+                 merged_df['类目'] = "Unknown"
             
         if 'clean_url' in merged_df.columns:
             merged_df = merged_df.drop(columns=['clean_url'])
         
         numeric_cols = ['费用', '转化价值', 'ROAS', '转化数']
-        missing_numeric = [col for col in numeric_cols if col not in merged_df.columns and col != '转化数'] # 转化数 is optional
+        # ROAS 是计算出来的，转化数是可选的。只有 费用和转化价值是必须的。
+        missing_numeric = [col for col in numeric_cols if col not in merged_df.columns and col not in ['转化数', 'ROAS']]
         
         if missing_numeric:
             st.error(f"严重错误：您的 Google Sheet 'Raw_Data' 表缺少以下关键数据列: {missing_numeric}。")
@@ -221,6 +276,9 @@ def upload_data(uploaded_files):
             existing_records = data[1:]
             if existing_records:
                 current_df = pd.DataFrame(existing_records, columns=headers)
+                # 关键修复：去除重复列名，防止 concat 报错
+                current_df = current_df.loc[:, ~current_df.columns.duplicated()]
+                # Filter out empty headers
                 current_df = current_df.loc[:, current_df.columns != '']
             else:
                  current_df = pd.DataFrame(columns=headers)
@@ -230,25 +288,21 @@ def upload_data(uploaded_files):
         st.error(f"读取现有数据出错: {e}")
         current_df = pd.DataFrame()
 
+    # Pre-cleaning existing data for merge
     if not current_df.empty:
-        required_cols = ['天', '广告账号']
-        if not all(col in current_df.columns for col in required_cols):
-             st.warning(f"警告：您的 Google Sheet 'Raw_Data' 工作表缺少必要的列头: {required_cols}。请确保表头为: 天, 广告账号, 最终到达网址, 费用, 转化价值, 转化数 (可选)")
-             # 虽然缺少列，但如果用户确认要传，我们可以尝试。但去重会失效。
-             # 为了安全，这里我们仍然允许上传，但去重逻辑会被跳过。
-             existing_keys = set()
-        else:
-            current_df['天'] = pd.to_datetime(current_df['天'], errors='coerce')
+        # Standardize '天' column for internal processing
+        if '天' in current_df.columns:
+            # Keep original for now, we will normalize later
+             pass
+        # Ensure Ad Account is string
+        if '广告账号' in current_df.columns:
             current_df['广告账号'] = current_df['广告账号'].astype(str)
-            existing_keys = set(zip(current_df['广告账号'], current_df['天']))
-    else:
-        existing_keys = set()
-        # 如果当前 sheet 为空，我们需要这一步的 headers 吗？
-        # 如果 data 为空，ws.get_all_values() 返回 []，所以 headers 未定义。
-        # 我们需要在 new_rows_list 生成后，根据 new_rows key 来作为 header 初始化 sheet。
-        pass
 
-    # 加载类目映射以生成 广告组id
+    # -------------------------------------------------------------------------
+    # Process Uploaded Files
+    # -------------------------------------------------------------------------
+    
+    # Load category map locally for processing new rows
     try:
         def clean_url_local(url):
             if pd.isna(url) or not url: return ""
@@ -267,22 +321,19 @@ def upload_data(uploaded_files):
     except:
         cat_lookup = {}
 
-    new_rows_list = []
-    
+    all_new_dfs = []
+
     for uploaded_file in uploaded_files:
         try:
             filename = uploaded_file.name
-            # 使用正则提取账号 ID (xxx-xxx-xxxx)
             match = re.search(r'(\d{3}-\d{3}-\d{4})', filename)
             account_id = match.group(0) if match else filename.split('.')[0].strip()
             
-            # 尝试多种编码和分隔符读取 CSV
             df = None
             last_err = ""
             for enc in ['utf-8-sig', 'utf-16', 'utf-8', 'gbk']:
                 try:
                     uploaded_file.seek(0)
-                    # 使用 sep=None 和 engine='python' 自动检测分隔符 (如逗号、制表符)
                     temp_df = pd.read_csv(uploaded_file, encoding=enc, sep=None, engine='python')
                     if not temp_df.empty and len(temp_df.columns) >= 2:
                         df = temp_df
@@ -292,71 +343,130 @@ def upload_data(uploaded_files):
                     continue
             
             if df is None:
-                st.error(f"无法读取文件 {filename}。错误详情: {last_err}")
-                st.info("建议：请尝试在 Excel 中打开该文件，检查内容是否正常，并另存为标准的 CSV (逗号分隔) 格式后重新上传。")
+                st.error(f"无法读取文件 {filename}。{last_err}")
                 continue
             
             df['广告账号'] = account_id
             # 兼容表头中可能存在的空格
             df.columns = [c.strip() for c in df.columns]
+            # 关键修复：去除 CSV 中的重复列名
+            df = df.loc[:, ~df.columns.duplicated()]
+
+            # Date Normalization
+            if '天' in df.columns:
+                df['天'] = pd.to_datetime(df['天'], errors='coerce').dt.strftime('%Y-%m-%d')
+                df = df.dropna(subset=['天'])
             
-            df['天'] = pd.to_datetime(df['天'], errors='coerce')
-            df = df.dropna(subset=['天']) # 过滤掉日期解析失败的行
+            # Enrich Data
+            # 1. Category
+            if '最终到达网址' in df.columns:
+                df['类目'] = df['最终到达网址'].apply(lambda x: cat_lookup.get(clean_url_local(x), "Unknown"))
+            else:
+                 df['类目'] = "Unknown"
+
+            # 2. Ad Group ID
+            # Ensure columns exist with default empty string
+            for col in ['广告系列', '广告组', '最终到达网址']:
+                if col not in df.columns:
+                    df[col] = ""
             
-            for _, row in df.iterrows():
-                key = (str(row['广告账号']), row['天'])
-                if key not in existing_keys:
-                    row_dict = row.to_dict()
-                    row_dict['天'] = row['天'].strftime('%Y-%m-%d')
-                    row_dict['广告账号'] = str(row_dict['广告账号'])
-                    
-                    # 匹配类目
-                    url_val = str(row_dict.get('最终到达网址', ''))
-                    clean_u = clean_url_local(url_val)
-                    category_found = cat_lookup.get(clean_u, "Unknown")
-                    row_dict['类目'] = category_found
-                    
-                    # 生成广告组id: 广告账号 + 广告系列 + 类目 + 落地页 + 广告组
-                    acc = str(row_dict.get('广告账号', ''))
-                    cmp = str(row_dict.get('广告系列', ''))
-                    cat = str(row_dict.get('类目', ''))
-                    grp = str(row_dict.get('广告组', ''))
-                    
-                    row_dict['广告组id'] = f"{acc}{cmp}{cat}{url_val}{grp}"
-                    
-                    new_rows_list.append(row_dict)
-                    
+            df['广告组id'] = df['广告账号'].astype(str) + df['广告系列'].astype(str) + df['类目'].astype(str) + df['最终到达网址'].astype(str) + df['广告组'].astype(str)
+            
+            all_new_dfs.append(df)
+            
         except Exception as e:
             st.error(f"处理文件 {uploaded_file.name} 时出错: {e}")
-    
-    if new_rows_list:
-        # 获取最新的 headers (如果 sheet 不为空)
-        if not current_df.empty and 'headers' in locals():
-            target_headers = headers
-        elif 'headers' in locals() and headers: # sheet 有头但无数据
-             target_headers = headers
+
+    # -------------------------------------------------------------------------
+    # Merge, Dedup, and Overwrite
+    # -------------------------------------------------------------------------
+    if all_new_dfs:
+        new_combined_df = pd.concat(all_new_dfs, ignore_index=True)
+        
+        # Combine Old and New
+        if not current_df.empty:
+            # Align schema - add missing cols to current_df if new data has them (and vice versa)
+            full_df = pd.concat([current_df, new_combined_df], ignore_index=True)
         else:
-            # Sheet 是完全空的，用新数据的 keys 作为 headers
-            target_headers = list(new_rows_list[0].keys())
-            # 确保关键列在前面? 可选。先这样。
-            ws.append_row(target_headers) # 先写入表头
+            full_df = new_combined_df
+
+        # DEFINITIVE DEDUPLICATION
+        # 1. Identify Metrics (to exclude from key)
+        exclude_metrics = [
+            '费用', '转化价值', '转化数', 'ROAS', 
+            'Cost', 'Conversions', 'Conversion value', 
+            'Clicks', 'Impressions', 'CTR', 'CPC', 'Views',
+            'Interactions', 'Interaction rate', 'Avg. cost', 'Avg. CPM',
+            'Search Impr. share', 'Display Impr. share', 'IIV', 'Invalid clicks'
+        ]
+        metric_keywords = ['cost', 'value', 'cpc', 'cpm', 'ctr', 'rate', 'clicks', 'impressions', 'conversions', 'roas', 'view']
         
-        rows_to_append = []
-        for item in new_rows_list:
-            row_data = []
-            for col in target_headers:
-                val = item.get(col, "")
-                if pd.isna(val):
-                     val = ""
-                row_data.append(val)
-            rows_to_append.append(row_data)
+        def is_metric_col(col_name):
+            if col_name in exclude_metrics: return True
+            c_lower = col_name.lower()
+            return any(kw in c_lower for kw in metric_keywords)
+
+        # 2. Clean Dimensions for Key Generation
+        dedup_subset = [c for c in full_df.columns if not is_metric_col(c)]
+        
+        if dedup_subset:
+            # Create a temporary Normalized Key for dedup
+            msg_cols = [c for c in dedup_subset if c in full_df.columns]
             
-        ws.append_rows(rows_to_append)
+            # Helper to normalize for dedup ONLY (without changing actual data)
+            # Actually, to be safe, let's normalize the ID column in the data itself
+            if '广告账号' in full_df.columns:
+                 # Extract standard ID format
+                 full_df['广告账号'] = full_df['广告账号'].astype(str).str.extract(r'(\d{3}-\d{3}-\d{4})', expand=False).fillna(full_df['广告账号']).str.strip()
+            
+            for c in msg_cols:
+                full_df[c] = full_df[c].astype(str).str.strip()
+
+            before_len = len(full_df)
+            full_df = full_df.drop_duplicates(subset=msg_cols, keep='last')
+            after_len = len(full_df)
+            st.info(f"数据合并统计: 合并前 {before_len} 行 -> 覆盖去重后 {after_len} 行 (减少 {before_len - after_len} 行)")
+
+        # 3. Write Back to Sheet (CLEAR + UPDATE)
+        # Handle NaN before writing
+        full_df = full_df.fillna("")
         
-        st.success(f"成功添加 {len(new_rows_list)} 行数据！")
-        st.cache_data.clear()
+        try:
+            ws.clear()
+            
+            # 1. Update headers
+            updated_headers = full_df.columns.tolist()
+            ws.update(range_name='A1', values=[updated_headers])
+            
+            # 2. Values - Batch Upload to avoid Proxy Timeout
+            updated_values = full_df.astype(str).values.tolist()
+            total_rows = len(updated_values)
+            chunk_size = 1000 # 每次上传 1000 行
+            
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for i in range(0, total_rows, chunk_size):
+                chunk = updated_values[i : i + chunk_size]
+                # append_rows 自动处理行号，比计算 range 更稳健
+                ws.append_rows(chunk)
+                
+                # Update progress
+                progress = min((i + chunk_size) / total_rows, 1.0)
+                progress_bar.progress(progress)
+                status_text.text(f"正在上传数据: {min(i + chunk_size, total_rows)} / {total_rows} 行...")
+                
+            status_text.empty()
+            progress_bar.empty()
+            
+            st.success(f"数据更新成功！已覆盖写入 {total_rows} 行数据。")
+            st.cache_data.clear()
+            
+        except Exception as e:
+            st.error(f"写入 Google Sheet 失败: {e}")
+            
     else:
-        st.warning("没有新数据可添加（检测到重复数据）。")
+        st.warning("没有读取到有效的新数据。")
 
 # -----------------------------------------------------------------------------
 # 主应用程序
