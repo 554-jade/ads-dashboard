@@ -118,6 +118,8 @@ def load_data():
             
             # 关键修复：过滤掉“广告账号”为空的行 (例如 Google Sheet 的空行)
             raw_df = raw_df[raw_df['广告账号'] != '']
+            # 过滤掉非法的 ID (不包含数字的，例如 'value', '--')
+            raw_df = raw_df[raw_df['广告账号'].astype(str).str.contains(r'\d', regex=True)]
 
             # ---------------------------------------------------------------------
             # 自动去重 (Deduplication)
@@ -627,8 +629,12 @@ def main():
             pivot_df = final_df.groupby(pivot_rows)[['费用', '转化价值']].sum().reset_index()
             pivot_df['ROAS'] = pivot_df['转化价值'] / pivot_df['费用']
             display_cols = pivot_rows + pivot_vals
+            styler = pivot_df[display_cols].style
+            if 'ROAS' in display_cols:
+                styler = styler.background_gradient(subset=['ROAS'], cmap="RdYlGn", vmin=0.5, vmax=2.0)
+            
             st.dataframe(
-                pivot_df[display_cols].style.background_gradient(subset=['ROAS'], cmap="RdYlGn", vmin=0.5, vmax=2.0),
+                styler,
                 use_container_width=True
             )
 
@@ -654,10 +660,10 @@ def main():
 
         # 改为垂直排列 (Vertical Layout)
         st.markdown("### 🔴 亏损榜 (按消耗降序 - 止损优先级)")
-        st.markdown("⚠️ **止损建议**: 下列广告子项消耗高且 ROAS < 1.0，应优先检查素材或关停。")
+        st.markdown("⚠️ **止损建议**: 下列广告子项消耗高且 ROAS < 1.7，应优先检查素材或关停。")
         
         # 红色列表按费用降序排（亏损最多的最先看）
-        red_list = granular_perf[(granular_perf['ROAS'] < 1.0) & (granular_perf['费用'] > 0)].sort_values('费用', ascending=False).head(20)
+        red_list = granular_perf[(granular_perf['ROAS'] < 1.7) & (granular_perf['费用'] > 0)].sort_values('费用', ascending=False).head(20)
         st.dataframe(
             red_list.style.format({"ROAS": "{:.2f}", "费用": "{:,.2f}", "转化价值": "{:,.2f}"})
                           .background_gradient(subset=['费用'], cmap="Reds"),
