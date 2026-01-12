@@ -533,27 +533,29 @@ def main():
         col_d, _ = st.columns([1, 3])
         with col_d:
             # 用户选择日期，我们将以该日期所在的月份作为统计周期
-            target_date = st.date_input("📅 选择统计月份", value=datetime.date.today(), help="选择任意一天即可选中该月")
+            target_date = st.date_input("📅 选择截止日期 (默认今天)", value=datetime.date.today(), help="将统计该月1号到此日期的累计数据")
         
         # 计算月份起止
         month_start = target_date.replace(day=1)
+        filter_end_date = target_date # 截止到选定的这一天
+        
+
+        
         _, days_in_month = monthrange(target_date.year, target_date.month)
-        month_end = target_date.replace(day=days_in_month)
         
         # 计算时间进度
+        # 逻辑修改：严格按照用户选择的截止日期计算进度
+        time_progress = target_date.day / days_in_month
+
         today = datetime.date.today()
-        # 逻辑：如果是本月，按今天计算；如果是过去月，进度100%；如果是未来月，进度0%
-        if target_date.year == today.year and target_date.month == today.month:
-            time_progress = today.day / days_in_month
+        if target_date == today:
             status_label = "本月进行中"
-        elif target_date < today:
-            time_progress = 1.0
-            status_label = "历史月份 (已结案)"
+        elif target_date > today:
+            status_label = "未来预测"
         else:
-            time_progress = 0.0
-            status_label = "未来月份"
+            status_label = "历史回溯"
             
-        st.info(f"🗓 统计范围: {month_start} ~ {month_end} ({status_label}) | ⏳ 月时间进度: **{time_progress:.2%}**")
+        st.info(f"🗓 统计范围: {month_start} ~ {filter_end_date} ({status_label}) | ⏳ 月时间进度: {target_date.day}/{days_in_month} = **{time_progress:.2%}**")
 
         # 2. 读取目标数据
         if not os.path.exists(GOAL_CSV_PATH):
@@ -577,8 +579,10 @@ def main():
                 # --- 3. 获取及筛选实际数据 (Actuals) ---
                 # 使用全局 df 进行筛选
                 # Note: `df` comes from global scope
-                mask_month = (df['天'].dt.date >= month_start) & (df['天'].dt.date <= month_end)
+                mask_month = (df['天'].dt.date >= month_start) & (df['天'].dt.date <= filter_end_date)
                 month_df = df[mask_month].copy()
+
+
                 
                 # 聚合实际数据
                 month_agg = month_df.groupby('广告账号').agg({
@@ -607,20 +611,31 @@ def main():
                 # D. 消耗进度 = 累计实际消耗 / 目标消耗额
                 merged['消耗进度'] = merged.apply(lambda x: x['累计实际消耗'] / x['目标消耗额'] if x['目标消耗额'] > 0 else 0, axis=1)
                 
-                # E. 消耗偏差值 = 累计实际消耗 - (目标消耗额 * 月时间进度)
-                merged['消耗偏差值'] = merged['累计实际消耗'] - (merged['目标消耗额'] * merged['月时间进度'])
+                # E. 消耗偏差值 = (累计GMV / 目标ROI) - 累计实际消耗
+                # 逻辑推导：根据图片数据 (18159 / 1.9 - 9291 = 266.36 -> 267)
+                # 含义：按照实际产出(GMV)和目标ROI计算出的“理论上限消耗” - “实际消耗”
+                # 正值 (Green)：实际花费 < 理论上限 (省预算/高ROI)
+                # 负值 (Red)：实际花费 > 理论上限 (超支/低ROI)
+                merged['消耗偏差值'] = merged.apply(lambda x: (x['累计GMV'] / x['目标ROI']) - x['累计实际消耗'] if x['目标ROI'] > 0 else -x['累计实际消耗'], axis=1)
                 
                 # F. 消耗进度与GMV进度差 = 消耗进度 - GMV进度
                 merged['消耗进度与GMV进度差'] = merged['消耗进度'] - merged['GMV进度']
                 
                 # G. 账号状态自动化公式
+                # G. 账号状态自动化公式
                 def get_status(row):
-                    if row['目标消耗额'] <= 0:
-                        return '无计划消耗'
-                    return '正常 (无需干预)'
+                    if row['目标消耗额'] == 0:
+                        return "无计划消耗"
+                    # Example logic:
+                    if row['消耗进度与GMV进度差'] > 0.10: # Spend > GMV by 10%
+                        return "消耗过快 (需优化)"
+                    elif row['GMV进度与时间进度差距'] < -0.20:
+                         return "进度严重滞后"
+                    return "正常 (无需干预)"
+
                 merged['账号状态'] = merged.apply(get_status, axis=1)
-                
-                # --- 6. 构造最终展示 DataFrame ---
+
+                # 6. 构造最终展示 DataFrame
                 display_cols = [
                     '优化师', '广告账号', 
                     '目标ROI', '月时间进度', 
@@ -648,7 +663,9 @@ def main():
                 sum_row['GMV进度'] = total_gmv / total_goal_gmv if total_goal_gmv > 0 else 0
                 sum_row['GMV进度与时间进度差距'] = sum_row['GMV进度'] - time_progress
                 sum_row['消耗进度'] = total_spend / total_goal_spend if total_goal_spend > 0 else 0
-                sum_row['消耗偏差值'] = total_spend - (total_goal_spend * time_progress)
+                # sum_row['消耗偏差值'] 不需要重算，直接累加即可反映整体盈亏
+                # sum_row['消耗偏差值'] = sum_row['累计实际消耗'] - (sum_row['目标消耗'] * time_progress) # DELETE OLD
+                
                 sum_row['消耗进度与GMV进度差'] = sum_row['消耗进度'] - sum_row['GMV进度']
                 
                 # Weighted ROI
