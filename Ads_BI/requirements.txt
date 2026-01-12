@@ -4,3 +4,8 @@ google-auth
 plotly
 pandas
 matplotlib
+
+SQLAlchemy
+PyMySQL
+mysql-connector-python
+openpyxl
